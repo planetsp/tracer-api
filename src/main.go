@@ -3,13 +3,16 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"time"
 
 	"cloud.google.com/go/firestore"
 	secretmanager "cloud.google.com/go/secretmanager/apiv1"
+	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
+
 	"google.golang.org/api/option"
 	secretmanagerpb "google.golang.org/genproto/googleapis/cloud/secretmanager/v1"
 )
@@ -19,24 +22,20 @@ var client *firestore.Client
 var err error
 
 type noteStruct struct {
-	Section    string    `firestore:"section"`
-	DatePosted time.Time `firestore:"datePosted"`
+	Section    string    `firestore:"section" json:"section"`
+	DatePosted time.Time `firestore:"datePosted" json:"datePosted"`
 	// Section type? Chapter vs page vs headline
 }
-type progressStruct struct {
-	ProgressValue float32   `firestore:"progressValue"`
-	LastUpdate    time.Time `firestore:"lastUpdate"`
-}
-type book struct {
-	ID                string         `firestore:"id"`
-	Title             string         `firestore:"title"`
-	Author            string         `firestore:"author"`
-	CoverURL          string         `firestore:"coverURL"`
-	Summary           string         `firestore:"summary"`
-	CurrentPageNumber int            `firestore:"currentPageNumber"`
-	TotalPageNumbers  int            `firestore:"totalPageNumbers"`
-	Progress          progressStruct `firestore:"progress"`
-	Notes             []noteStruct   `firestore:"notes"`
+type bookStruct struct {
+	ID                  string       `firestore:"id" json:"id"`
+	Title               string       `firestore:"title" json:"title"`
+	Author              string       `firestore:"author" json:"author"`
+	CoverURL            string       `firestore:"coverURL" json:"coverUrl"`
+	Summary             string       `firestore:"summary" json:"summary"`
+	CurrentPageNumber   int          `firestore:"currentPageNumber" json:"currentPageNumber"`
+	TotalPageNumbers    int          `firestore:"totalPageNumbers" json:"totalPageNumbers"`
+	LastUpdatedProgress time.Time    `firestore:"lastUpdatedProgress" json:"lastUpdatedProgress"`
+	Notes               []noteStruct `firestore:"notes" json:"notes"`
 }
 type server struct{}
 
@@ -63,20 +62,18 @@ func getCredentials() []byte {
 		return nil
 	}
 
-	// WARNING: Do not print the secret in a production environment - this snippet
-	// is showing how to access the secret material.
-	log.Printf("Plaintext: %s\n", string(result.Payload.Data))
 	return result.Payload.Data
 }
 
 // Adds book
-func addBook(bookData book) (bool, error) {
+func addBook(bookData bookStruct, userID string) (bool, error) {
+	log.Print("Attempint to add", bookData)
 	var err error
 	added := true
-	books := client.Collection("books")
-	book := books.Doc(bookData.ID)
-
-	_, err = book.Create(ctx, bookData)
+	book := client.Collection("users/" + userID + "/books").NewDoc()
+	bookData.ID = book.ID
+	bookData.LastUpdatedProgress = time.Now()
+	_, err = book.Set(ctx, bookData)
 
 	if err != nil {
 		log.Panic("Failed to create book", err)
@@ -85,20 +82,22 @@ func addBook(bookData book) (bool, error) {
 	return added, err
 }
 
-func getAllBooks() []byte {
+func getAllBooks(userID string) []byte {
 	log.Println("Attempting to GET all books in this collection")
-	books := client.Collection("books")
+	books := client.Collection("users/" + userID + "/books")
 	docsnaps, err := books.DocumentRefs(ctx).GetAll()
-	var booksData []book
+	booksData := []bookStruct{}
 	if err != nil {
-		log.Panic("Error getting doc refs:", err)
+		log.Print("Error getting doc refs:", err)
+		jsonData, _ := json.Marshal(booksData)
+		return jsonData
 	}
 	for _, ds := range docsnaps {
 		docsnap, err := ds.Get(ctx)
 		if err != nil {
 			log.Fatal("Error looping through document data", err)
 		}
-		var bookData book
+		var bookData bookStruct
 		if err := docsnap.DataTo(&bookData); err != nil {
 			log.Panic("Could not read data from book in", err)
 			continue
@@ -106,28 +105,33 @@ func getAllBooks() []byte {
 		log.Print(bookData)
 		booksData = append(booksData, bookData)
 	}
-	jsonData, err := json.Marshal(booksData)
+	response := make(map[string][]bookStruct)
+	response["books"] = booksData
+	jsonData, err := json.Marshal(response)
 	if err != nil {
 		log.Fatal("cannot convert to json")
 	}
 	return jsonData
 }
 
-func getBook(bookID string) ([]byte, error) {
+func getBook(bookID string, userID string) ([]byte, error) {
 	log.Printf("Attempting to GET %s books in this collection", bookID)
 	var err error
-	books := client.Collection("books")
+	books := client.Collection("users/" + userID + "/books")
 	docsnaps, err := books.DocumentRefs(ctx).GetAll()
-	var booksData []book
+	booksData := []bookStruct{}
 	if err != nil {
 		log.Panic("Error getting doc refs:", err)
+		jsonData, _ := json.Marshal(booksData)
+		return jsonData, err
 	}
 	for _, ds := range docsnaps {
 		docsnap, err := ds.Get(ctx)
 		if err != nil {
 			log.Fatal("Error looping through document data", err)
+
 		}
-		var bookData book
+		var bookData bookStruct
 		if err := docsnap.DataTo(&bookData); err != nil {
 			log.Panic("Could not read data from book in", err)
 			continue
@@ -147,11 +151,12 @@ func getBook(bookID string) ([]byte, error) {
 	return jsonData, err
 }
 
-func updateBook(bookData book) (bool, error) {
+func updateBook(bookData bookStruct, userID string) (bool, error) {
 	var err error
 	updated := true
-	books := client.Collection("books")
+	books := client.Collection("users/" + userID + "/books")
 	docsnaps := books.Doc(bookData.ID)
+	bookData.LastUpdatedProgress = time.Now()
 	_, err = docsnaps.Set(ctx, bookData)
 	if err != nil {
 		log.Panic("Failed to update", err)
@@ -161,10 +166,10 @@ func updateBook(bookData book) (bool, error) {
 	return updated, err
 }
 
-func deleteBook(bookID string) (bool, error) {
+func deleteBook(bookID string, userID string) (bool, error) {
 	var err error
 	deleted := true
-	books := client.Collection("books")
+	books := client.Collection("users/" + userID + "/books")
 	_, err = books.Doc(bookID).Delete(ctx)
 
 	if err != nil {
@@ -176,7 +181,12 @@ func deleteBook(bookID string) (bool, error) {
 
 // Calls Google Books API when user is adding a book
 // to see if there is a match in metadata
-func suggestBook() {
+func suggestBook(searchString string) [5]bookStruct {
+	apiEndpoint := "https://www.googleapis.com/books/v1/volumes?q="
+
+	var bookSuggestions [5]bookStruct
+	fmt.Print(apiEndpoint)
+	return bookSuggestions
 
 }
 func books(w http.ResponseWriter, r *http.Request) {
@@ -185,9 +195,10 @@ func books(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case "GET":
 		// get a specific ID
+		userID := r.Header.Get("UserID")
 		if r.Header.Get("bookID") != "" {
 			bookID := r.Header.Get("bookID")
-			thisBook, err := getBook(bookID)
+			thisBook, err := getBook(bookID, userID)
 			if err != nil {
 				w.WriteHeader(http.StatusNotFound)
 			} else {
@@ -196,21 +207,24 @@ func books(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte(thisBook))
 		} else {
 			// Get all books
-			booksJSONData := getAllBooks()
+			booksJSONData := getAllBooks(userID)
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte(booksJSONData))
 		}
 
 	case "POST":
-		var bookData book
+		var bookData bookStruct
+		log.Println("POST called")
 		err := json.NewDecoder(r.Body).Decode(&bookData)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
+			log.Panic("Failed to do POST", err)
 			return
 		}
-
-		postAttemped, err := addBook(bookData)
-
+		log.Printf(bookData.Author)
+		userID := r.Header.Get("UserID")
+		postAttemped, err := addBook(bookData, userID)
+		log.Printf("ADD book called")
 		if err != nil {
 			log.Panic(err)
 		} else if postAttemped {
@@ -222,13 +236,15 @@ func books(w http.ResponseWriter, r *http.Request) {
 		}
 
 	case "PUT":
-		var bookData book
+		var bookData bookStruct
 		err := json.NewDecoder(r.Body).Decode(&bookData)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		putAttempted, err := updateBook(bookData)
+		userID := r.Header.Get("UserID")
+
+		putAttempted, err := updateBook(bookData, userID)
 		if err != nil {
 			log.Panic(err)
 		} else if putAttempted {
@@ -240,8 +256,10 @@ func books(w http.ResponseWriter, r *http.Request) {
 		}
 
 	case "DELETE":
-		if r.Header.Get("bookID") != "" {
-			deleteAttempted, err := deleteBook(r.Header.Get("bookID"))
+		if r.Header.Get("BookID") != "" {
+			userID := r.Header.Get("UserID")
+			bookID := r.Header.Get("BookID")
+			deleteAttempted, err := deleteBook(bookID, userID)
 			if err != nil {
 				log.Panic(err)
 			} else if deleteAttempted {
@@ -259,6 +277,12 @@ func books(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 		w.Write([]byte(`{"message": "not found"}`))
 	}
+}
+func users(w http.ResponseWriter, r *http.Request) {
+	log.Printf("Reached the users endpoint")
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"message": "UP"}`))
 }
 func health(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Reached the health endpoint")
@@ -280,8 +304,12 @@ func main() {
 	log.Printf("Started the application server")
 	r.HandleFunc("/health", health)
 	r.HandleFunc("/books", books)
+	r.HandleFunc("/users", users)
+	headersOk := handlers.AllowedHeaders([]string{"X-Requested-With", "UserID", "BookID", "Content-Type"})
+	originsOk := handlers.AllowedOrigins([]string{"http://localhost:3000"})
+	methodsOk := handlers.AllowedMethods([]string{"GET", "DELETE", "HEAD", "POST", "PUT", "OPTIONS"})
 
 	log.Printf("Serving on localhost:8080")
-	log.Fatal(http.ListenAndServe(":8080", r))
+	log.Fatal(http.ListenAndServe(":8080", handlers.CORS(originsOk, headersOk, methodsOk)(r)))
 
 }
